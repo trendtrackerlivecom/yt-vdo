@@ -1,36 +1,31 @@
-# YT-VDO — Rebuilt Web Edition
+# WebSearch — one page, every source
 
-An updated Flask + yt-dlp + FFmpeg video downloader for content you own or are authorized to save.
+A small Flask app that collects live search results from several sources and
+shows them together on one clean page.
 
-## What changed
-- Uses **Deno** as the yt-dlp recommended JavaScript runtime instead of relying on Node runtime configuration.
-- Installs `yt-dlp[default]` (including yt-dlp-ejs) at image build time.
-- Keeps the existing website design and video+audio validation.
-- Adds `/health` to show installed runtime and package versions.
-- More useful extraction exceptions in Render logs; public errors do not leak server details.
+## Sources
+- **Bing** — HTML results page
+- **DuckDuckGo** — HTML results page
+- **Brave Search** — HTML results page
+- **Mojeek** — HTML results page
+- **Wikipedia** — official API (quick-fact card + articles)
+
+All sources are queried in parallel; whichever answer are merged,
+de-duplicated and shown with a per-source count. Some engines block
+datacenter IPs, so the counts on the page show exactly which sources
+responded from the host.
+
+Google cannot be scraped reliably from a server (CAPTCHA wall for
+datacenter IPs), so the page offers an "Open this search in Google"
+button instead. A Google Programmable Search API key can be plugged
+into `app.py` later if wanted.
 
 ## Render Docker deployment
-1. Push all project files to GitHub repository root.
-2. In Render create or update a **Web Service**, choose **Docker** environment.
+1. Push all project files to the GitHub repository root.
+2. Web Service → Docker environment.
 3. Deploy with **Clear build cache & deploy**.
-4. Open `https://YOUR-RENDER-URL/health` and verify Deno, yt-dlp and EJS versions.
-5. Analyze a video you own or have permission to download.
-6. If extraction still fails, inspect Render Logs; a blocked cloud IP cannot be fixed by installing a different runtime.
+4. Open `/health` — should return `{"status":"ok", ...}`.
 
-## Local run
-Install Python 3.12+, FFmpeg and Deno 2.3+ on PATH, then:
-
-```bash
-python -m venv .venv
-. .venv/bin/activate
-pip install -r requirements.txt
-python app.py
-```
-
-## Limitations
-- Source quality is available only when provided by the platform.
-- MP4 and 3GP conversion may be CPU-intensive and may time out on free hosting.
-- This project is not guaranteed to work against YouTube restrictions on datacenter IPs.
-- Current in-memory job queue and temporary local disk are not suitable for production multi-instance deployment.
-- Add authentication, per-IP rate limits, request quotas, monitoring, and stronger isolation before opening to public users.
-- This project does not bypass DRM or access private videos.
+## Note
+The previous YT-VDO downloader version lives in this repo's Git history
+(and in a local backup) and can be restored at any time.

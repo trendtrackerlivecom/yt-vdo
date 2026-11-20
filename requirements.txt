@@ -1,3 +1,4 @@
 Flask>=3.1,<4
 gunicorn>=23,<25
-yt-dlp[default]>=2026.10.26
+requests>=2.32
+beautifulsoup4>=4.12

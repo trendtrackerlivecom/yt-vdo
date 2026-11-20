@@ -1,129 +1,279 @@
-import os, re, uuid, time, threading, subprocess, shutil, logging
-from pathlib import Path
-from urllib.parse import urlparse
-from flask import Flask, render_template, request, jsonify, send_file, abort
-import yt_dlp
+"""WebSearch — one search page that collects results from several sources.
 
-app=Flask(__name__)
-logging.basicConfig(level=logging.INFO)
+Sources (server-side, no API keys needed):
+  - Bing        (HTML results page)
+  - DuckDuckGo  (HTML results page)
+  - Wikipedia   (official API — quick-fact card + article link)
 
-ROOT=Path(__file__).resolve().parent
-OUT=ROOT/'downloads'; OUT.mkdir(exist_ok=True)
-JOBS={}; LOCK=threading.Lock()
-MAX_ACTIVE=int(os.getenv('MAX_ACTIVE','2'))
-MAX_DURATION=int(os.getenv('MAX_DURATION','7200'))
-MAX_BYTES=int(os.getenv('MAX_BYTES',str(3*1024**3)))
-QUALITY={144,240,360,480,720,1080,1440,2160}
+Google cannot be scraped reliably from a server (it answers datacenter IPs
+with CAPTCHAs), so the page links out to Google for the same query instead.
+If a Google Programmable Search API key is ever added, plug it into
+google_api() below — the merge code already knows the result shape.
+"""
+import re
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
-def valid_url(url):
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, jsonify, render_template, request
+
+app = Flask(__name__)
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "en-US,en;q=0.9",
+}
+TIMEOUT = 8
+CACHE = {}
+CACHE_TTL = 300  # seconds
+
+
+def clean(text):
+    return re.sub(r"\s+", " ", text or "").strip()
+
+
+def norm_url(url):
+    """Normalise a URL for de-duplication."""
     try:
-        p=urlparse(url)
-        host=(p.hostname or '').lower()
-        return p.scheme=='https' and host in {'youtube.com','www.youtube.com','m.youtube.com','youtu.be','www.youtu.be','youtube-nocookie.com','www.youtube-nocookie.com'} and len(url)<2048 and not p.username and not p.password
-    except Exception:return False
+        p = urlparse(url)
+        host = (p.netloc or "").lower().removeprefix("www.")
+        path = (p.path or "").rstrip("/")
+        return host + path
+    except Exception:
+        return url
 
-def probe(path):
-    p=subprocess.run(['ffprobe','-v','error','-show_entries','stream=codec_type','-of','default=noprint_wrappers=1:nokey=1',str(path)],capture_output=True,text=True,timeout=30)
-    return p.returncode==0 and 'video' in p.stdout.splitlines() and 'audio' in p.stdout.splitlines()
 
-def clean():
-    while True:
-        time.sleep(600)
-        cutoff=time.time()-3600
-        with LOCK:
-            for jid,j in list(JOBS.items()):
-                if j.get('finished_at',float('inf'))<cutoff:
-                    shutil.rmtree(OUT/jid,ignore_errors=True); JOBS.pop(jid,None)
-threading.Thread(target=clean,daemon=True).start()
-
-@app.get('/')
-def index():return render_template('index.html')
-
-@app.post('/api/info')
-def info():
-    url=(request.get_json(silent=True) or {}).get('url','').strip()
-    if not valid_url(url):return jsonify(error='Enter a valid YouTube video HTTPS URL.'),400
+def unwrap_bing(href):
+    """Bing wraps result links (bing.com/ck/a?...&u=a1<base64>) — decode them."""
+    if "bing.com/ck/a" not in href:
+        return href
     try:
-        with yt_dlp.YoutubeDL({'quiet':True,'no_warnings':True,'noplaylist':True,'skip_download':True,'socket_timeout':20,'retries':2,'extract_flat':False}) as y:
-            d=y.extract_info(url,download=False)
-        if d.get('_type')=='playlist':return jsonify(error='Only individual videos are supported.'),400
-        if (d.get('duration') or 0)>MAX_DURATION:return jsonify(error='Video is too long for this server.'),400
-        heights=sorted({f.get('height') for f in d.get('formats',[]) if f.get('height') in QUALITY})
-        return jsonify(title=d.get('title','Video'),duration=d.get('duration'),thumbnail=d.get('thumbnail'),qualities=heights)
-    except Exception as e:
-        app.logger.exception('Analyze extraction failed')
-        return jsonify(error='YouTube extraction failed on this server. See server logs; a hosting IP restriction or upstream extractor change may be responsible.'),422
+        u = parse_qs(urlparse(href).query).get("u", [""])[0]
+        if u.startswith("a1"):
+            import base64
 
-def worker(jid,url,quality,fmt):
-    folder=OUT/jid
-    def progress(d):
-        if d['status']=='downloading':
-            total=d.get('total_bytes') or d.get('total_bytes_estimate') or 0
-            if total>MAX_BYTES:raise RuntimeError('Download exceeds server size limit')
-            with LOCK:JOBS[jid].update(status='downloading',percent=round(d.get('downloaded_bytes',0)*100/total,1) if total else 0,speed=d.get('_speed_str',''))
-        elif d['status']=='finished':
-            with LOCK:JOBS[jid].update(status='processing',percent=100)
-    try:
-        folder.mkdir(exist_ok=True)
-        opts={'format':f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]', 'outtmpl':str(folder/'%(title).100B-%(id)s.%(ext)s'),'noplaylist':True,'quiet':True,'no_warnings':True,'progress_hooks':[progress],'merge_output_format':'mkv','max_filesize':MAX_BYTES,'socket_timeout':20,'retries':3,'fragment_retries':3,'restrictfilenames':True}
-        with yt_dlp.YoutubeDL(opts) as y:y.download([url])
-        candidates=[p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {'.mkv','.mp4','.webm','.mov','.3gp'}]
-        if not candidates:raise RuntimeError('No video output produced')
-        src=max(candidates,key=lambda p:p.stat().st_size)
-        if fmt=='mkv' and src.suffix.lower()=='.mkv':dest=src
-        else:
-            dest=folder/f'YT-VDO-{jid[:8]}.{fmt}'
-            if fmt=='mp4':cmd=['ffmpeg','-y','-i',str(src),'-map','0:v:0','-map','0:a:0','-c:v','libx264','-preset','veryfast','-crf','23','-c:a','aac','-b:a','160k','-movflags','+faststart',str(dest)]
-            elif fmt=='3gp':cmd=['ffmpeg','-y','-i',str(src),'-map','0:v:0','-map','0:a:0','-vf','scale=352:288:force_original_aspect_ratio=decrease,pad=352:288:(ow-iw)/2:(oh-ih)/2','-r','15','-c:v','h263','-b:v','350k','-c:a','aac','-ar','22050','-ac','1','-b:a','48k',str(dest)]
-            else:cmd=['ffmpeg','-y','-i',str(src),'-map','0:v:0','-map','0:a:0','-c','copy',str(dest)]
-            with LOCK:JOBS[jid]['status']='processing'
-            r=subprocess.run(cmd,capture_output=True,text=True,timeout=3600)
-            if r.returncode:raise RuntimeError('FFmpeg conversion failed: '+r.stderr[-350:])
-        if not probe(dest):raise RuntimeError('Output does not contain both video and audio streams')
-        for p in folder.iterdir():
-            if p!=dest and p.is_file():p.unlink(missing_ok=True)
-        with LOCK:JOBS[jid].update(status='done',percent=100,file=dest.name,finished_at=time.time())
-    except Exception as e:
-        app.logger.exception('Download failed for job %s', jid)
-        with LOCK:JOBS[jid].update(status='error',error=str(e)[:350],finished_at=time.time())
+            pad = "=" * (-len(u[2:]) % 4)
+            return base64.urlsafe_b64decode(u[2:] + pad).decode("utf-8", "replace")
+    except Exception:
+        pass
+    return href
 
-@app.post('/api/download')
-def download():
-    data=request.get_json(silent=True) or {}; url=str(data.get('url','')).strip(); fmt=data.get('format'); quality=data.get('quality')
-    try:quality=int(quality)
-    except (TypeError,ValueError):quality=0
-    if not valid_url(url) or fmt not in {'mp4','mkv','3gp'} or quality not in QUALITY:return jsonify(error='Invalid download settings'),400
-    with LOCK:
-        if sum(j['status'] not in {'done','error'} for j in JOBS.values())>=MAX_ACTIVE:return jsonify(error='Server busy. Try again shortly.'),429
-        jid=uuid.uuid4().hex; JOBS[jid]={'status':'queued','percent':0,'created_at':time.time()}
-    threading.Thread(target=worker,args=(jid,url,quality,fmt),daemon=True).start()
-    return jsonify(id=jid),202
 
-@app.get('/api/status/<jid>')
-def status(jid):
-    with LOCK:j=JOBS.get(jid); return (jsonify(j) if j else (jsonify(error='Job not found'),404))
+def bing(query):
+    url = f"https://www.bing.com/search?q={quote_plus(query)}&count=20"
+    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    out = []
+    for item in soup.select("li.b_algo"):
+        a = item.select_one("h2 a")
+        if not a or not a.get("href"):
+            continue
+        snippet = item.select_one(".b_caption p")
+        out.append(
+            {
+                "title": clean(a.get_text()),
+                "url": unwrap_bing(a["href"]),
+                "snippet": clean(snippet.get_text()) if snippet else "",
+                "source": "Bing",
+            }
+        )
+    return out
 
-@app.get('/api/file/<jid>')
-def file(jid):
-    with LOCK:j=JOBS.get(jid)
-    if not j or j.get('status')!='done':abort(404)
-    p=OUT/jid/j['file']
-    if not p.is_file():abort(404)
-    return send_file(p,as_attachment=True,download_name=p.name)
 
-if __name__=='__main__':app.run(host='127.0.0.1',port=5000)
+def brave(query):
+    url = f"https://search.brave.com/search?q={quote_plus(query)}"
+    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    out = []
+    for item in soup.select("div.snippet"):
+        a = item.select_one("a[href^='http']")
+        if not a:
+            continue
+        title_el = item.select_one(".title") or a
+        snippet = item.select_one(".snippet-description")
+        out.append(
+            {
+                "title": clean(title_el.get_text()),
+                "url": a["href"],
+                "snippet": clean(snippet.get_text()) if snippet else "",
+                "source": "Brave",
+            }
+        )
+    return out
 
-@app.get('/health')
-def health():
-    from importlib.metadata import version, PackageNotFoundError
-    def cmd(binary):
+
+def mojeek(query):
+    url = f"https://www.mojeek.com/search?q={quote_plus(query)}"
+    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    out = []
+    for item in soup.select("ul.results-standard li"):
+        a = item.select_one("a.title")
+        if not a or not a.get("href"):
+            continue
+        snippet = item.select_one("p.s")
+        out.append(
+            {
+                "title": clean(a.get_text()),
+                "url": a["href"],
+                "snippet": clean(snippet.get_text()) if snippet else "",
+                "source": "Mojeek",
+            }
+        )
+    return out
+
+
+def duckduckgo(query):
+    url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+    r = requests.get(url, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    soup = BeautifulSoup(r.text, "html.parser")
+    out = []
+    for item in soup.select(".result"):
+        a = item.select_one("a.result__a")
+        if not a or not a.get("href"):
+            continue
+        href = a["href"]
+        # DDG wraps result links: //duckduckgo.com/l/?uddg=<real url>
+        qs = parse_qs(urlparse(href).query)
+        if "uddg" in qs:
+            href = unquote(qs["uddg"][0])
+        snippet = item.select_one(".result__snippet")
+        out.append(
+            {
+                "title": clean(a.get_text()),
+                "url": href,
+                "snippet": clean(snippet.get_text()) if snippet else "",
+                "source": "DuckDuckGo",
+            }
+        )
+    return out
+
+
+def wikipedia(query):
+    """Return (fact_card_or_None, [article results])."""
+    api = (
+        "https://en.wikipedia.org/w/api.php?action=query&format=json"
+        "&generator=search&gsrnamespace=0&gsrlimit=3"
+        "&prop=extracts|info&exintro&explaintext&inprop=url"
+        f"&gsrsearch={quote_plus(query)}"
+    )
+    r = requests.get(api, headers=HEADERS, timeout=TIMEOUT)
+    r.raise_for_status()
+    pages = (r.json().get("query") or {}).get("pages") or {}
+    pages = sorted(pages.values(), key=lambda p: p.get("index", 99))
+    fact = None
+    results = []
+    for i, p in enumerate(pages):
+        url = p.get("fullurl", "")
+        extract = clean(p.get("extract", ""))
+        if i == 0 and extract:
+            fact = {
+                "title": p.get("title", ""),
+                "text": extract[:600],
+                "url": url,
+                "source": "Wikipedia",
+            }
+        results.append(
+            {
+                "title": p.get("title", ""),
+                "url": url,
+                "snippet": extract[:220],
+                "source": "Wikipedia",
+            }
+        )
+    return fact, results
+
+
+def search_all(query):
+    cached = CACHE.get(query.lower())
+    if cached and time.time() - cached[0] < CACHE_TTL:
+        return cached[1]
+
+    fetchers = (
+        ("Bing", bing),
+        ("DuckDuckGo", duckduckgo),
+        ("Brave", brave),
+        ("Mojeek", mojeek),
+    )
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        futures = {name: ex.submit(fn, query) for name, fn in fetchers}
+        f_wiki = ex.submit(wikipedia, query)
+
+    sources = {}
+    by_source = {}
+    for name, fut in futures.items():
         try:
-            result=subprocess.run([binary,'--version'],capture_output=True,text=True,timeout=5)
-            return (result.stdout or result.stderr).strip().splitlines()[0][:90]
+            by_source[name] = fut.result()
+            sources[name] = len(by_source[name])
         except Exception:
-            return 'unavailable'
-    try: ytdlp_version=version('yt-dlp')
-    except PackageNotFoundError: ytdlp_version='unavailable'
-    try: ejs_version=version('yt-dlp-ejs')
-    except PackageNotFoundError: ejs_version='unavailable'
-    return jsonify(status='ok',yt_dlp=ytdlp_version,ejs=ejs_version,deno=cmd('deno'),ffmpeg=cmd('ffmpeg'))
+            by_source[name] = []
+            sources[name] = 0
+
+    fact = None
+    wiki_results = []
+    try:
+        fact, wiki_results = f_wiki.result()
+        sources["Wikipedia"] = len(wiki_results)
+    except Exception:
+        sources["Wikipedia"] = 0
+
+    # Interleave all web sources round-robin, de-duplicated by normalised URL.
+    merged, seen = [], set()
+    pools = [by_source[name] for name, _ in fetchers]
+    for i in range(max((len(p) for p in pools), default=0)):
+        for pool in pools:
+            if i < len(pool):
+                item = pool[i]
+                key = norm_url(item["url"])
+                if key not in seen:
+                    seen.add(key)
+                    merged.append(item)
+    # Wikipedia articles not already present go right after the fact card.
+    for item in wiki_results:
+        key = norm_url(item["url"])
+        if key not in seen:
+            seen.add(key)
+            merged.append(item)
+
+    payload = {
+        "query": query,
+        "fact": fact,
+        "results": merged[:30],
+        "sources": sources,
+        "google_url": f"https://www.google.com/search?q={quote_plus(query)}",
+    }
+    CACHE[query.lower()] = (time.time(), payload)
+    return payload
+
+
+@app.get("/")
+def home():
+    return render_template("index.html")
+
+
+@app.get("/api/search")
+def api_search():
+    q = clean(request.args.get("q", ""))
+    if not q:
+        return jsonify(error="Type something to search."), 400
+    if len(q) > 300:
+        return jsonify(error="Search text is too long."), 400
+    return jsonify(search_all(q))
+
+
+@app.get("/health")
+def health():
+    return jsonify(status="ok", app="websearch", sources=["Bing", "DuckDuckGo", "Brave", "Mojeek", "Wikipedia"])
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
