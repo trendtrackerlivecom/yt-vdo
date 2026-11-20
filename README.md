@@ -1,48 +1,36 @@
-# YT-VDO
+# YT-VDO — Rebuilt Web Edition
 
-Flask + yt-dlp + FFmpeg video downloader. Download only videos you own or have permission to download. YouTube access and format availability may change; no guarantee for every video.
+An updated Flask + yt-dlp + FFmpeg video downloader for content you own or are authorized to save.
 
-## Local run (Windows / Linux / macOS)
+## What changed
+- Uses **Deno** as the yt-dlp recommended JavaScript runtime instead of relying on Node runtime configuration.
+- Installs `yt-dlp[default]` (including yt-dlp-ejs) at image build time.
+- Keeps the existing website design and video+audio validation.
+- Adds `/health` to show installed runtime and package versions.
+- More useful extraction exceptions in Render logs; public errors do not leak server details.
 
-1. Install Python 3.12+, FFmpeg, and FFprobe (both must be on PATH).
-2. `python -m venv .venv`
-3. Activate: Windows `.venv\Scripts\activate` / Linux `source .venv/bin/activate`
-4. `pip install -r requirements.txt`
-5. `python app.py` and visit http://127.0.0.1:5000
+## Render Docker deployment
+1. Push all project files to GitHub repository root.
+2. In Render create or update a **Web Service**, choose **Docker** environment.
+3. Deploy with **Clear build cache & deploy**.
+4. Open `https://YOUR-RENDER-URL/health` and verify Deno, yt-dlp and EJS versions.
+5. Analyze a video you own or have permission to download.
+6. If extraction still fails, inspect Render Logs; a blocked cloud IP cannot be fixed by installing a different runtime.
 
-## Docker
+## Local run
+Install Python 3.12+, FFmpeg and Deno 2.3+ on PATH, then:
 
-`docker build -t yt-vdo .`
-
-`docker run --rm -p 8000:8000 yt-vdo`
-
-Open http://localhost:8000.
-
-## GitHub and online deployment
-
-1. Create a repository named `yt-vdo` at https://github.com/new.
-2. Upload the **contents** of this folder (not the ZIP itself).
-3. On a Docker-capable hosting service, connect the repository and select Dockerfile deployment. Set port 8000 (or allow the platform to set `PORT`).
-4. Use a persistent process and sufficient disk space. Some hosts block YouTube downloads or limit disk/CPU/network. Test with your own permitted video.
-
-## Notes and limitations
-
-- Output MP4 is H.264/AAC, MKV is remuxed if possible, and 3GP is downscaled to 352×288 with H.263/AAC. 3GP is not 4K; its legacy format has low resolution.
-- Quality is a *maximum requested source height*, not an upscaling guarantee. Source streams vary.
-- Server jobs are kept in process memory; a restart cancels them. Files are deleted after about one hour. For production, add persistent queue, authenticated users, per-user quotas, rate limiting, CSRF protection and dedicated workers. Do not deploy this unprotected as a public unlimited downloader.
-- Audio presence is verified with ffprobe; the app fails rather than presenting a silent output as successful.
-- This code has not been end-to-end tested against live YouTube in this environment.
-
-## YouTube extraction fix (November 2026)
-
-The Docker image includes Node.js 22 and installs `yt-dlp[default]`, which includes the JavaScript challenge solver package. Both Analyze and Download enable the Node runtime explicitly. Rebuild the Docker image (on Render: **Manual Deploy → Clear build cache & deploy**).
-
-For debugging, open the Render shell (if your plan supports it) and run:
-
-```sh
-node --version
-python -m yt_dlp --version
-python -m yt_dlp -v --js-runtimes node --skip-download 'https://www.youtube.com/watch?v=YOUR_VIDEO_ID'
+```bash
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements.txt
+python app.py
 ```
 
-This addresses missing JS runtime/challenge support, **not** YouTube IP blocks, authentication restrictions, or every future player change. If extraction still fails, inspect the verbose log.
+## Limitations
+- Source quality is available only when provided by the platform.
+- MP4 and 3GP conversion may be CPU-intensive and may time out on free hosting.
+- This project is not guaranteed to work against YouTube restrictions on datacenter IPs.
+- Current in-memory job queue and temporary local disk are not suitable for production multi-instance deployment.
+- Add authentication, per-IP rate limits, request quotas, monitoring, and stronger isolation before opening to public users.
+- This project does not bypass DRM or access private videos.

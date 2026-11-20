@@ -1,10 +1,12 @@
-import os, re, uuid, time, threading, subprocess, shutil
+import os, re, uuid, time, threading, subprocess, shutil, logging
 from pathlib import Path
 from urllib.parse import urlparse
 from flask import Flask, render_template, request, jsonify, send_file, abort
 import yt_dlp
 
 app=Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
 ROOT=Path(__file__).resolve().parent
 OUT=ROOT/'downloads'; OUT.mkdir(exist_ok=True)
 JOBS={}; LOCK=threading.Lock()
@@ -12,13 +14,6 @@ MAX_ACTIVE=int(os.getenv('MAX_ACTIVE','2'))
 MAX_DURATION=int(os.getenv('MAX_DURATION','7200'))
 MAX_BYTES=int(os.getenv('MAX_BYTES',str(3*1024**3)))
 QUALITY={144,240,360,480,720,1080,1440,2160}
-# Enable Node.js for yt-dlp's YouTube JavaScript challenge solver.
-# The bgutil script provider (its server is built into the Docker image)
-# generates PO Tokens so YouTube accepts requests from cloud IPs, and
-# source_address forces IPv4 — YouTube often returns an empty player
-# response to cloud IPv6 ranges ("Failed to extract any player response").
-BGUTIL_SERVER_HOME=os.getenv('BGUTIL_SERVER_HOME','/opt/bgutil/server')
-YTDLP_JS={'js_runtimes': {'node': {}},'extractor_args': {'youtubepot-bgutilscript': {'server_home': [BGUTIL_SERVER_HOME]}},'source_address': '0.0.0.0'}
 
 def valid_url(url):
     try:
@@ -49,13 +44,15 @@ def info():
     url=(request.get_json(silent=True) or {}).get('url','').strip()
     if not valid_url(url):return jsonify(error='Enter a valid YouTube video HTTPS URL.'),400
     try:
-        with yt_dlp.YoutubeDL({'quiet':True,'no_warnings':True,'noplaylist':True,'skip_download':True,'socket_timeout':15,'extract_flat':False,**YTDLP_JS}) as y:
+        with yt_dlp.YoutubeDL({'quiet':True,'no_warnings':True,'noplaylist':True,'skip_download':True,'socket_timeout':20,'retries':2,'extract_flat':False}) as y:
             d=y.extract_info(url,download=False)
         if d.get('_type')=='playlist':return jsonify(error='Only individual videos are supported.'),400
         if (d.get('duration') or 0)>MAX_DURATION:return jsonify(error='Video is too long for this server.'),400
         heights=sorted({f.get('height') for f in d.get('formats',[]) if f.get('height') in QUALITY})
         return jsonify(title=d.get('title','Video'),duration=d.get('duration'),thumbnail=d.get('thumbnail'),qualities=heights)
-    except Exception as e:return jsonify(error=f'Could not analyze video: {str(e)[:250]}'),422
+    except Exception as e:
+        app.logger.exception('Analyze extraction failed')
+        return jsonify(error='YouTube extraction failed on this server. See server logs; a hosting IP restriction or upstream extractor change may be responsible.'),422
 
 def worker(jid,url,quality,fmt):
     folder=OUT/jid
@@ -68,7 +65,7 @@ def worker(jid,url,quality,fmt):
             with LOCK:JOBS[jid].update(status='processing',percent=100)
     try:
         folder.mkdir(exist_ok=True)
-        opts={'format':f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]', 'outtmpl':str(folder/'%(title).100B-%(id)s.%(ext)s'),'noplaylist':True,'quiet':True,'no_warnings':True,'progress_hooks':[progress],'merge_output_format':'mkv','max_filesize':MAX_BYTES,'socket_timeout':20,'retries':3,'fragment_retries':3,'restrictfilenames':True,**YTDLP_JS}
+        opts={'format':f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]', 'outtmpl':str(folder/'%(title).100B-%(id)s.%(ext)s'),'noplaylist':True,'quiet':True,'no_warnings':True,'progress_hooks':[progress],'merge_output_format':'mkv','max_filesize':MAX_BYTES,'socket_timeout':20,'retries':3,'fragment_retries':3,'restrictfilenames':True}
         with yt_dlp.YoutubeDL(opts) as y:y.download([url])
         candidates=[p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {'.mkv','.mp4','.webm','.mov','.3gp'}]
         if not candidates:raise RuntimeError('No video output produced')
@@ -87,6 +84,7 @@ def worker(jid,url,quality,fmt):
             if p!=dest and p.is_file():p.unlink(missing_ok=True)
         with LOCK:JOBS[jid].update(status='done',percent=100,file=dest.name,finished_at=time.time())
     except Exception as e:
+        app.logger.exception('Download failed for job %s', jid)
         with LOCK:JOBS[jid].update(status='error',error=str(e)[:350],finished_at=time.time())
 
 @app.post('/api/download')
@@ -114,3 +112,18 @@ def file(jid):
     return send_file(p,as_attachment=True,download_name=p.name)
 
 if __name__=='__main__':app.run(host='127.0.0.1',port=5000)
+
+@app.get('/health')
+def health():
+    from importlib.metadata import version, PackageNotFoundError
+    def cmd(binary):
+        try:
+            result=subprocess.run([binary,'--version'],capture_output=True,text=True,timeout=5)
+            return (result.stdout or result.stderr).strip().splitlines()[0][:90]
+        except Exception:
+            return 'unavailable'
+    try: ytdlp_version=version('yt-dlp')
+    except PackageNotFoundError: ytdlp_version='unavailable'
+    try: ejs_version=version('yt-dlp-ejs')
+    except PackageNotFoundError: ejs_version='unavailable'
+    return jsonify(status='ok',yt_dlp=ytdlp_version,ejs=ejs_version,deno=cmd('deno'),ffmpeg=cmd('ffmpeg'))

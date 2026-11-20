@@ -1,5 +1,6 @@
-.git
-__pycache__
+__pycache__/
 *.pyc
-downloads
+.git/
+downloads/
+*.zip
 .env
