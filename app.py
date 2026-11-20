@@ -12,6 +12,8 @@ MAX_ACTIVE=int(os.getenv('MAX_ACTIVE','2'))
 MAX_DURATION=int(os.getenv('MAX_DURATION','7200'))
 MAX_BYTES=int(os.getenv('MAX_BYTES',str(3*1024**3)))
 QUALITY={144,240,360,480,720,1080,1440,2160}
+# Enable Node.js for yt-dlp's YouTube JavaScript challenge solver.
+YTDLP_JS={'js_runtimes': {'node': {}}}
 
 def valid_url(url):
     try:
@@ -42,7 +44,7 @@ def info():
     url=(request.get_json(silent=True) or {}).get('url','').strip()
     if not valid_url(url):return jsonify(error='Enter a valid YouTube video HTTPS URL.'),400
     try:
-        with yt_dlp.YoutubeDL({'quiet':True,'no_warnings':True,'noplaylist':True,'skip_download':True,'socket_timeout':15,'extract_flat':False}) as y:
+        with yt_dlp.YoutubeDL({'quiet':True,'no_warnings':True,'noplaylist':True,'skip_download':True,'socket_timeout':15,'extract_flat':False,**YTDLP_JS}) as y:
             d=y.extract_info(url,download=False)
         if d.get('_type')=='playlist':return jsonify(error='Only individual videos are supported.'),400
         if (d.get('duration') or 0)>MAX_DURATION:return jsonify(error='Video is too long for this server.'),400
@@ -61,7 +63,7 @@ def worker(jid,url,quality,fmt):
             with LOCK:JOBS[jid].update(status='processing',percent=100)
     try:
         folder.mkdir(exist_ok=True)
-        opts={'format':f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]', 'outtmpl':str(folder/'%(title).100B-%(id)s.%(ext)s'),'noplaylist':True,'quiet':True,'no_warnings':True,'progress_hooks':[progress],'merge_output_format':'mkv','max_filesize':MAX_BYTES,'socket_timeout':20,'retries':3,'fragment_retries':3,'restrictfilenames':True}
+        opts={'format':f'bestvideo[height<={quality}]+bestaudio/best[height<={quality}]', 'outtmpl':str(folder/'%(title).100B-%(id)s.%(ext)s'),'noplaylist':True,'quiet':True,'no_warnings':True,'progress_hooks':[progress],'merge_output_format':'mkv','max_filesize':MAX_BYTES,'socket_timeout':20,'retries':3,'fragment_retries':3,'restrictfilenames':True,**YTDLP_JS}
         with yt_dlp.YoutubeDL(opts) as y:y.download([url])
         candidates=[p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in {'.mkv','.mp4','.webm','.mov','.3gp'}]
         if not candidates:raise RuntimeError('No video output produced')

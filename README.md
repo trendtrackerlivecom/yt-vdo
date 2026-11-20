@@ -32,3 +32,17 @@ Open http://localhost:8000.
 - Server jobs are kept in process memory; a restart cancels them. Files are deleted after about one hour. For production, add persistent queue, authenticated users, per-user quotas, rate limiting, CSRF protection and dedicated workers. Do not deploy this unprotected as a public unlimited downloader.
 - Audio presence is verified with ffprobe; the app fails rather than presenting a silent output as successful.
 - This code has not been end-to-end tested against live YouTube in this environment.
+
+## YouTube extraction fix (November 2026)
+
+The Docker image includes Node.js 22 and installs `yt-dlp[default]`, which includes the JavaScript challenge solver package. Both Analyze and Download enable the Node runtime explicitly. Rebuild the Docker image (on Render: **Manual Deploy → Clear build cache & deploy**).
+
+For debugging, open the Render shell (if your plan supports it) and run:
+
+```sh
+node --version
+python -m yt_dlp --version
+python -m yt_dlp -v --js-runtimes node --skip-download 'https://www.youtube.com/watch?v=YOUR_VIDEO_ID'
+```
+
+This addresses missing JS runtime/challenge support, **not** YouTube IP blocks, authentication restrictions, or every future player change. If extraction still fails, inspect the verbose log.
