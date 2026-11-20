@@ -13,7 +13,12 @@ MAX_DURATION=int(os.getenv('MAX_DURATION','7200'))
 MAX_BYTES=int(os.getenv('MAX_BYTES',str(3*1024**3)))
 QUALITY={144,240,360,480,720,1080,1440,2160}
 # Enable Node.js for yt-dlp's YouTube JavaScript challenge solver.
-YTDLP_JS={'js_runtimes': {'node': {}}}
+# The bgutil script provider (its server is built into the Docker image)
+# generates PO Tokens so YouTube accepts requests from cloud IPs, and
+# source_address forces IPv4 — YouTube often returns an empty player
+# response to cloud IPv6 ranges ("Failed to extract any player response").
+BGUTIL_SERVER_HOME=os.getenv('BGUTIL_SERVER_HOME','/opt/bgutil/server')
+YTDLP_JS={'js_runtimes': {'node': {}},'extractor_args': {'youtubepot-bgutilscript': {'server_home': [BGUTIL_SERVER_HOME]}},'source_address': '0.0.0.0'}
 
 def valid_url(url):
     try:
