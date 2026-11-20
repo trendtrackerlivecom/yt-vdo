@@ -1,3 +1,56 @@
-const $=id=>document.getElementById(id),error=t=>$('error').textContent=t;
-$('analyze').onclick=async()=>{error('');$('info').hidden=true;$('analyze').disabled=true;try{const r=await fetch('/api/info',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('url').value.trim()})});const d=await r.json();if(!r.ok)throw Error(d.error);$('title').textContent=d.title;$('quality').replaceChildren();for(const q of d.qualities){const o=document.createElement('option');o.value=q;o.textContent=q===2160?'4K (2160p)':q===1440?'2K (1440p)':q+'p';$('quality').append(o)}if(!d.qualities.length)throw Error('No supported video qualities found.');$('quality').value=String(d.qualities.at(-1));$('info').hidden=false}catch(e){error(e.message)}finally{$('analyze').disabled=false}};
-$('download').onclick=async()=>{error('');$('download').disabled=true;$('progress').hidden=false;$('file').hidden=true;$('status').textContent='Starting...';$('bar').value=0;try{let r=await fetch('/api/download',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url:$('url').value.trim(),quality:$('quality').value,format:$('format').value})});let d=await r.json();if(!r.ok)throw Error(d.error);for(;;){await new Promise(res=>setTimeout(res,1500));r=await fetch('/api/status/'+d.id);const s=await r.json();if(!r.ok)throw Error(s.error);$('status').textContent=s.status==='processing'?'Merging and checking audio...':`${s.status} ${s.percent||0}%`;$('bar').value=s.percent||0;if(s.status==='error')throw Error(s.error);if(s.status==='done'){$('status').textContent='Completed — audio and video verified';$('file').href='/api/file/'+d.id;$('file').hidden=false;break}}}catch(e){error(e.message)}finally{$('download').disabled=false}};
+const q = document.getElementById('q');
+const go = document.getElementById('go');
+const err = document.getElementById('error');
+const meta = document.getElementById('meta');
+const fact = document.getElementById('fact');
+const results = document.getElementById('results');
+
+function esc(s) {
+  return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function hostOf(u) {
+  try { return new URL(u).hostname.replace(/^www\./, ''); } catch { return ''; }
+}
+
+async function search() {
+  const query = q.value.trim();
+  err.textContent = '';
+  fact.hidden = true;
+  meta.hidden = true;
+  results.innerHTML = '';
+  if (!query) { err.textContent = 'Type something to search first.'; return; }
+  go.disabled = true;
+  go.textContent = 'Searching…';
+  try {
+    const r = await fetch('/api/search?q=' + encodeURIComponent(query));
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || 'Search failed.');
+    const counts = Object.entries(data.sources).map(([k, v]) => `${k}: ${v}`).join(' · ');
+    meta.innerHTML = `<span>${data.results.length} results — ${esc(counts)}</span><a class="gbtn" href="${esc(data.google_url)}" target="_blank" rel="noopener">Open this search in Google ↗</a>`;
+    meta.hidden = false;
+    if (data.fact) {
+      fact.innerHTML = `<div class="src">Wikipedia — quick fact</div><h2>${esc(data.fact.title)}</h2><p>${esc(data.fact.text)}</p><a href="${esc(data.fact.url)}" target="_blank" rel="noopener">Read the full article ↗</a>`;
+      fact.hidden = false;
+    }
+    if (!data.results.length) {
+      results.innerHTML = '<p class="hint">No results came back from any source. Try different words.</p>';
+    } else {
+      results.innerHTML = data.results.map(item => `
+        <div class="result">
+          <div class="rhead"><span class="src">${esc(item.source)}</span><span class="host">${esc(hostOf(item.url))}</span></div>
+          <a class="rtitle" href="${esc(item.url)}" target="_blank" rel="noopener">${esc(item.title)}</a>
+          <p class="rsnip">${esc(item.snippet)}</p>
+        </div>`).join('');
+    }
+  } catch (e) {
+    err.textContent = e.message || 'Search failed.';
+  } finally {
+    go.disabled = false;
+    go.textContent = 'Search';
+  }
+}
+
+go.addEventListener('click', search);
+q.addEventListener('keydown', e => { if (e.key === 'Enter') search(); });
+q.focus();
